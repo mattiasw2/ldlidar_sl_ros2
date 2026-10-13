@@ -1,2 +1,2 @@
 .vscode
-*.json
+*.json__pycache__/
