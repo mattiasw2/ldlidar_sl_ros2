@@ -1,162 +1,165 @@
-**Note:** STL-19P (LD19P) LIDAR has 230400 baud rate and ```'product_name': 'LDLiDAR_LD14P'``` setting works for it.
+# ldlidar_sl_ros2
 
-See https://github.com/slgrobotics/robots_bringup/blob/main/Docs/Sensors/LD14.md
+ROS 2 driver for the LDROBOT LD14 / LD14P / LD19P (STL-19P) 2D lidars, plus a
+ready-made SLAM setup for building a map by carrying the lidar around by hand.
 
-**Note:** the point cloud on `pointcloud2d` is published as `sensor_msgs/msg/PointCloud2` (fields `x`, `y`, `z`, `intensity`); the bundled `rviz2/ldlidar.rviz` shows both the LaserScan and the PointCloud2 display.
+This is a fork of the vendor driver
+([ldrobotSensorTeam/ldlidar_sl_ros2](https://github.com/ldrobotSensorTeam/ldlidar_sl_ros2))
+via [slgrobotics](https://github.com/slgrobotics/robots_bringup/blob/main/Docs/Sensors/LD14.md),
+which added intensity filtering, a constant beam count per revolution and LD19P
+support. On top of that this fork adds a `PointCloud2` output, launch files that
+survive snap-packaged terminals, and the SLAM configuration described below.
 
-================================= Original README: ======================================
+Tested with an LD19P on Ubuntu 26.04 / ROS 2 lyrical. The LD19P runs at
+230400 baud and works with the `LDLiDAR_LD14P` product setting, so everything
+below that says LD14P applies to it as well.
 
-# Instructions
+## Hardware setup
 
-> This SDK is only applicable to the LiDAR products sold by Shenzhen LDROBOT Co., LTD. The product models are :
-> - LDROBOT LiDAR LD14
-> - LDROBOT LiDAR LD14P
-
-## step 0: get LiDAR ROS2 Package
-```bash
-cd ~
-
-mkdir -p ldlidar_ros2_ws/src
-
-cd ldlidar_ros2_ws/src
-
-git clone  https://github.com/ldrobotSensorTeam/ldlidar_sl_ros2.git
-```
-## step 1: system setup
-- Connect the LiDAR to your system motherboard via an onboard serial port or usB-to-serial module (for example, CP2102 module).
-
-- Set the -x permission for the serial port device mounted by the radar in the system (for example, /dev/ttyUSB0)
-
-  - In actual use, the LiDAR can be set according to the actual mounted status of your system, you can use 'ls -l /dev' command to view.
-
-``` bash
-cd ~/ldlidar_ros2_ws
-
-sudo chmod 777 /dev/ttyUSB0
-```
-- Modify the `port_name` value in the Lanuch file corresponding to the radar product model under `launch/`, using `ld14.launch.py` as an example, as shown below.
-
-```py
-#!/usr/bin/env python3
-from launch import LaunchDescription
-from launch_ros.actions import Node
-
-'''
-Parameter Description:
----
-- Set laser scan directon: 
-  1. Set counterclockwise, example: {'laser_scan_dir': True}
-  2. Set clockwise,        example: {'laser_scan_dir': False}
-- Angle crop setting, Mask data within the set angle range:
-  1. Enable angle crop fuction:
-    1.1. enable angle crop,  example: {'enable_angle_crop_func': True}
-    1.2. disable angle crop, example: {'enable_angle_crop_func': False}
-  2. Angle cropping interval setting:
-  - The distance and intensity data within the set angle range will be set to 0.
-  - angle >= 'angle_crop_min' and angle <= 'angle_crop_max' which is [angle_crop_min, angle_crop_max], unit is degress.
-    example:
-      {'angle_crop_min': 135.0}
-      {'angle_crop_max': 225.0}
-      which is [135.0, 225.0], angle unit is degress.
-'''
-
-def generate_launch_description():
-  # LDROBOT LiDAR publisher node
-  ldlidar_node = Node(
-      package='ldlidar_sl_ros2',
-      executable='ldlidar_sl_ros2_node',
-      name='ldlidar_publisher_ld14',
-      output='screen',
-      parameters=[
-        {'product_name': 'LDLiDAR_LD14'},
-        {'laser_scan_topic_name': 'scan'},
-        {'point_cloud_2d_topic_name': 'pointcloud2d'},
-        {'frame_id': 'base_laser'},
-        {'port_name': '/dev/ttyUSB0'},
-        {'serial_baudrate' : 115200},
-        {'laser_scan_dir': True},
-        {'enable_angle_crop_func': False},
-        {'angle_crop_min': 135.0},
-        {'angle_crop_max': 225.0},
-        {'min_intensity': 0},
-        {'do_filtering': True},
-        {'do_triplets': False}
-      ]
-  )
-
-  # base_link to base_laser tf node
-  base_link_to_laser_tf_node = Node(
-    package='tf2_ros',
-    executable='static_transform_publisher',
-    name='base_link_to_base_laser_ld14',
-    arguments=['0','0','0.18','0','0','0','base_link','base_laser']
-  )
-
-
-  # Define LaunchDescription variable
-  ld = LaunchDescription()
-
-  ld.add_action(ldlidar_node)
-  ld.add_action(base_link_to_laser_tf_node)
-
-  return ld
-```
-
-## step 2: build
-
-Run the following command.
+The lidar is connected through a CP2102 USB-to-serial adapter and shows up as
+`/dev/ttyUSB0`. Either add yourself to the `dialout` group (log out and back in),
+or install the udev rule, which also creates a stable `/dev/ldlidar` symlink:
 
 ```bash
-cd ~/ldlidar_ros2_ws
-
-colcon build
+cd scripts
+./create_udev_rules.sh      # ./delete_udev_rules.sh removes it again
 ```
-## step 3: run
 
-### step3.1: package environment variable settings
+## Build
 
-- After the compilation is completed, you need to add the relevant files generated by the compilation to the environment variables, so that the ROS environment can recognize them. The execution command is as follows. This command is to temporarily add environment variables to the terminal, which means that if you reopen a new terminal, you also need to re-execute it. The following command.
-  
-  ```bash
-  cd ~/ldlidar_ros2_ws
-  
-  source install/local_setup.bash
-  ```
-  
-- In order to never need to execute the above command to add environment variables after reopening the terminal, you can do the following.
-
-  ```bash
-  echo "source ~/ldlidar_ros2_ws/install/local_setup.bash" >> ~/.bashrc
-  
-  source ~/.bashrc
-  ```
-### step3.2: start LiDAR node
-
-- The product is LDROBOT LiDAR LD14
-  - start ld14 lidar node:
-  ``` bash
-  ros2 launch ldlidar_sl_ros2 ld14.launch.py
-  ```
-  - start ld14 lidar node and show on the Rviz2:
-  ``` bash
-  ros2 launch ldlidar_sl_ros2 viewer_ld14.launch.py
-  ```
-
-- The product is LDROBOT LiDAR LD14P
-  - start ld14p lidar node:
-  ``` bash
-  ros2 launch ldlidar_sl_ros2 ld14p.launch.py
-  ```
-  - start ld14p lidar node and show on the Rviz2:
-  ``` bash
-  ros2 launch ldlidar_sl_ros2 viewer_ld14p.launch.py
-  ```
-
-## step 4: test
-
-> The code supports ubuntu 20.04 ros2 foxy version and above, using rviz2 visualization.
-
-- new a terminal (Ctrl + Alt + T) and use Rviz2 tool(run command: `rviz2`) ,open the `ldlidar.rviz` file below the rviz2 folder of the readme file directory
 ```bash
-rviz2
+mkdir -p ~/ldlidar_ws/src
+git clone https://github.com/mattiasw2/ldlidar_sl_ros2.git ~/ldlidar_ws/src/ldlidar_sl_ros2
+cd ~/ldlidar_ws
+colcon build --symlink-install
+echo "source ~/ldlidar_ws/install/setup.bash" >> ~/.bashrc
 ```
+
+Runtime dependencies beyond the ROS 2 base install: `rviz2`, `tf2_ros`,
+`slam_toolbox` (SLAM only). On Ubuntu: `sudo apt install ros-$ROS_DISTRO-slam-toolbox`.
+
+## Running the driver
+
+| Launch file | What it starts |
+|---|---|
+| `ld14.launch.py` | driver for LD14 (115200 baud) |
+| `ld14p.launch.py` | driver for LD14P / LD19P (230400 baud) |
+| `viewer_ld14.launch.py`, `viewer_ld14p.launch.py` | driver + RViz with `rviz2/ldlidar.rviz` |
+| `slam_ld14p.launch.py` | driver + slam_toolbox + RViz map view, see [SLAM](#slam) |
+
+```bash
+ros2 launch ldlidar_sl_ros2 viewer_ld14p.launch.py
+```
+
+The driver publishes:
+
+| Topic / frame | Type | Notes |
+|---|---|---|
+| `/scan` | `sensor_msgs/LaserScan` | one message per revolution, about 6 Hz, ~500 beams, 0 to 2π counter-clockwise |
+| `/pointcloud2d` | `sensor_msgs/PointCloud2` | same points as `x`, `y`, `z`, `intensity` |
+| `base_link -> base_laser` | static TF | lidar 0.18 m above `base_link`; edit the launch file for your mount |
+
+Parameters (set in the launch files):
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `product_name` | `LDLiDAR_LD14P` | `LDLiDAR_LD14` or `LDLiDAR_LD14P` (also for LD19P) |
+| `port_name`, `serial_baudrate` | `/dev/ttyUSB0`, 230400 | serial device; LD14 uses 115200 |
+| `frame_id` | `base_laser` | frame of the published scans |
+| `laser_scan_topic_name`, `point_cloud_2d_topic_name` | `scan`, `pointcloud2d` | output topics |
+| `laser_scan_dir` | `true` | `true` = counter-clockwise |
+| `enable_angle_crop_func`, `angle_crop_min`, `angle_crop_max` | `false`, 135, 225 | zero out ranges inside the angle interval (degrees), e.g. where a robot body blocks the view |
+| `min_intensity` | 0 | drop returns with intensity below this value (noise on shiny or distant surfaces) |
+| `do_filtering` | `true` | the SDK's near-point filter |
+| `do_triplets` | `false` | average each three neighbouring beams into one, cutting the beam count by three |
+
+The beam count per revolution is measured over the first 20 revolutions and
+every later scan is padded or trimmed to that count. SLAM front-ends such as
+slam_toolbox reject scans whose beam count changes, so this matters.
+
+### Snap-packaged terminals
+
+When launched from the terminal of a snap-packaged application (the snap
+version of VS Code, for example), `rviz2` dies with exit code 127 and a
+`GLIBC_PRIVATE` error because the snap injects its own library paths. The
+viewer and SLAM launch files detect this and restore the original environment
+before starting any node, so they can be run from such a terminal.
+
+## SLAM
+
+### What SLAM does
+
+SLAM stands for Simultaneous Localization And Mapping. Building a map from
+scans needs the sensor pose for every scan, and knowing the pose needs a map to
+match the scan against, so both have to be solved together. Each new scan is
+aligned against the map built so far (scan matching), which yields the new
+pose, and the scan is then rasterised into the map at that pose. When the
+sensor returns to a place it has seen before, loop closure detects the overlap
+and distributes the accumulated drift along the whole path.
+
+The output is an occupancy grid, a bitmap with 5 cm cells that are free (white),
+occupied (black) or unknown (grey), plus the trajectory as the transform
+`map -> odom`.
+
+### How it is set up here
+
+[slam_toolbox](https://github.com/SteveMacenski/slam_toolbox) in online
+asynchronous mapping mode. slam_toolbox expects this transform chain:
+
+```
+map -> odom -> base_link -> base_laser
+ ^       ^         ^
+ |       |         static, from ld14p.launch.py
+ |       odometry; a static identity transform here, there is no odometry
+ published by slam_toolbox
+```
+
+Because there is no odometry, two things in `config/slam_toolbox_ld14p.yaml`
+differ from the usual defaults:
+
+- `minimum_travel_distance` and `minimum_travel_heading` are 0. slam_toolbox
+  decides whether to process a scan by how far odometry says the sensor moved.
+  With a static odom frame that is always zero, so the defaults would process
+  the first scan and then nothing.
+- `minimum_time_interval` (0.2 s) paces scan processing instead, and the scan
+  matcher search window is widened to about ±0.3 m and ±30° per processed scan.
+
+### Running it
+
+```bash
+ros2 launch ldlidar_sl_ros2 slam_ld14p.launch.py              # driver + slam_toolbox + RViz
+ros2 launch ldlidar_sl_ros2 slam_ld14p.launch.py rviz:=false  # headless
+```
+
+Keep the lidar level, move at a slow walking pace, turn slowly, and come back
+to where you started so the loop can be closed. Save while slam_toolbox is
+still running:
+
+```bash
+# occupancy grid as room.pgm + room.yaml (what nav2 map_server loads)
+ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data: '/home/me/maps/room'}}"
+# pose graph as room.posegraph + room.data (lets slam_toolbox continue or localize later)
+ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: '/home/me/maps/room'}"
+```
+
+### Result of a first walkthrough
+
+Three rooms of a flat, lidar carried by hand, no odometry, no IMU:
+
+![Occupancy grid from a hand-carried walkthrough](docs/slam_walkthrough_map.png)
+
+The rooms come out with straight walls and the right proportions, but the
+transitions between them show the limits of odometry-free scan matching: where
+the lidar was turned quickly in a doorway the matcher lost track for a moment,
+so some walls appear twice and the rooms are slightly rotated against each
+other. The stray grey wedges are floor hits from tilting the lidar.
+
+Both problems come from the missing motion prior. The next step is an IMU
+mounted on the lidar: its gyro gives slam_toolbox the rotation between scans,
+which removes the doubled walls, and its roll and pitch allow tilted scans to be
+dropped or projected back onto the horizontal plane. A gimbal would only solve
+the tilt, so the IMU is the better investment, and it carries over to a robot.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Original driver copyright SHENZHEN LDROBOT CO., LTD.
