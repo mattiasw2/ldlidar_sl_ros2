@@ -34,7 +34,7 @@ void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr& lidarpub);
 
 void  ToSensorPointCloudMessagePublish(ldlidar::Points2D& src, LaserScanSetting& setting,
-  rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr& lidarpub);
+  rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& lidarpub);
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
@@ -147,8 +147,8 @@ int main(int argc, char **argv) {
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr lidar_pub_laserscan = 
       node->create_publisher<sensor_msgs::msg::LaserScan>(laser_scan_topic_name, 10);
   
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr lidar_pub_pointcloud = 
-      node->create_publisher<sensor_msgs::msg::PointCloud>(point_cloud_2d_topic_name, 10);
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_pub_pointcloud = 
+      node->create_publisher<sensor_msgs::msg::PointCloud2>(point_cloud_2d_topic_name, 10);
 
   rclcpp::WallRate r(6); //Hz
 
@@ -367,24 +367,11 @@ void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq,
 }
 
 void  ToSensorPointCloudMessagePublish(ldlidar::Points2D& src, LaserScanSetting& setting,
-  rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr& lidarpub) {
+  rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& lidarpub) {
   
-  rclcpp::Time start_scan_time;
-  double scan_time;
-  float time_increment;
-  static rclcpp::Time end_scan_time;
-  static bool first_scan = true;
+  rclcpp::Time start_scan_time = node->now();
 
   ldlidar::Points2D dst = src;
-
-  start_scan_time = node->now();
-  scan_time = (start_scan_time.seconds() - end_scan_time.seconds());
-
-  if (first_scan) {
-    first_scan = false;
-    end_scan_time = start_scan_time;
-    return;
-  }
 
   if (setting.laser_scan_dir) {
     for (auto&point : dst) {
@@ -397,50 +384,40 @@ void  ToSensorPointCloudMessagePublish(ldlidar::Points2D& src, LaserScanSetting&
 
   int frame_points_num = static_cast<int>(dst.size());
 
-  sensor_msgs::msg::PointCloud output;
+  sensor_msgs::msg::PointCloud2 output;
 
   output.header.stamp = start_scan_time;
   //output.header.stamp = start_scan_time - rclcpp::Duration(TIME_SHIFT_SEC, TIME_SHIFT_NSEC);
   output.header.frame_id = setting.frame_id;
 
-  sensor_msgs::msg::ChannelFloat32 defaultchannelval[3];
+  // Unordered 2D cloud: one row, frame_points_num columns, fields x y z intensity (float32 each)
+  sensor_msgs::PointCloud2Modifier modifier(output);
+  modifier.setPointCloud2Fields(4,
+    "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "intensity", 1, sensor_msgs::msg::PointField::FLOAT32);
+  modifier.resize(frame_points_num);
+  output.height = 1;
+  output.width = frame_points_num;
+  output.is_dense = true;
 
-  defaultchannelval[0].name = std::string("intensity");
-  defaultchannelval[0].values.assign(frame_points_num, std::numeric_limits<float>::quiet_NaN());
-  // output.channels.assign(1, defaultchannelval);
-  output.channels.push_back(defaultchannelval[0]);
+  sensor_msgs::PointCloud2Iterator<float> iter_x(output, "x");
+  sensor_msgs::PointCloud2Iterator<float> iter_y(output, "y");
+  sensor_msgs::PointCloud2Iterator<float> iter_z(output, "z");
+  sensor_msgs::PointCloud2Iterator<float> iter_i(output, "intensity");
 
-  if (frame_points_num <= 1) {
-    time_increment = 0;
-  } else {
-    time_increment = static_cast<float>(scan_time / (double)(frame_points_num - 1));
-  }
-  defaultchannelval[1].name = std::string("timeincrement");
-  defaultchannelval[1].values.assign(1, time_increment);
-  output.channels.push_back(defaultchannelval[1]);
-  
-  defaultchannelval[2].name = std::string("scantime");
-  defaultchannelval[2].values.assign(1, scan_time);
-  output.channels.push_back(defaultchannelval[2]);
-
-  geometry_msgs::msg::Point32 points_xyz_defaultval;
-  points_xyz_defaultval.x = std::numeric_limits<float>::quiet_NaN();
-  points_xyz_defaultval.y = std::numeric_limits<float>::quiet_NaN();
-  points_xyz_defaultval.z = std::numeric_limits<float>::quiet_NaN();
-  output.points.assign(frame_points_num, points_xyz_defaultval);
-
-  for (int i = 0; i < frame_points_num; i++) {
+  for (int i = 0; i < frame_points_num; i++, ++iter_x, ++iter_y, ++iter_z, ++iter_i) {
     float range = dst[i].distance / 1000.f;  // distance unit transform to meters
     float intensity = dst[i].intensity;      // laser receive intensity 
     float dir_angle = ANGLE_TO_RADIAN(dst[i].angle);
     //  Convert polar coordinates to Cartesian coordinates:
-    output.points[i].x = range * cos(dir_angle);
-    output.points[i].y = range * sin(dir_angle);
-    output.points[i].z = 0.0;
-    output.channels[0].values[i] = intensity;
+    *iter_x = range * cos(dir_angle);
+    *iter_y = range * sin(dir_angle);
+    *iter_z = 0.0f;
+    *iter_i = intensity;
   }
   lidarpub->publish(output);
-  end_scan_time = start_scan_time;
 }
 
 /********************* (C) COPYRIGHT SHENZHEN LDROBOT CO., LTD *******END OF FILE ********/

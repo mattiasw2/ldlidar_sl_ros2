@@ -2,6 +2,8 @@
 
 See https://github.com/slgrobotics/robots_bringup/blob/main/Docs/Sensors/LD14.md
 
+**Note:** the point cloud on `pointcloud2d` is published as `sensor_msgs/msg/PointCloud2` (fields `x`, `y`, `z`, `intensity`); the bundled `rviz2/ldlidar.rviz` shows both the LaserScan and the PointCloud2 display.
+
 ================================= Original README: ======================================
 
 # Instructions
