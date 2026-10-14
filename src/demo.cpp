@@ -18,6 +18,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <algorithm>
+#include <vector>
+
 #include "ros2_api.h"
 #include "ldlidar_driver.h"
 
@@ -72,6 +75,7 @@ int main(int argc, char **argv) {
   // Added to measure average beam count (points per revolution) at start:
   int beam_count = 0;
   int beam_count_i = 0;
+  std::vector<int> beam_count_samples;
 
   // declare ros2 param
   node->declare_parameter<std::string>("product_name", product_name);
@@ -222,15 +226,20 @@ int main(int argc, char **argv) {
           // Measure average beam count (points per revolution) at start:
           if(beam_count_i > 1) {
             // skip the first sample, it is messed up
-            beam_count += n_points;
+            beam_count_samples.push_back(n_points);
           }
           //RCLCPP_INFO(node->get_logger(), "LIDAR beam count: %d", n_points);
           if(beam_count_i == n_samples) {
-            beam_count = beam_count / (n_samples - 1);
+            // Median, not mean: a single partial revolution in the samples
+            // (e.g. after a system clock jump) would otherwise shift the
+            // reference by more than the +-5 tolerance below and every later
+            // revolution would be dropped.
+            std::sort(beam_count_samples.begin(), beam_count_samples.end());
+            beam_count = beam_count_samples[beam_count_samples.size() / 2];
 
             beam_count = (beam_count / 3) * 3; // ensure it consists of triples for filtering
 
-            RCLCPP_INFO(node->get_logger(), "LIDAR: Average beam count: %d", beam_count);
+            RCLCPP_INFO(node->get_logger(), "LIDAR: Median beam count: %d", beam_count);
           }
         } else if(abs(n_points - beam_count) < 5) {
           // ensure the size of points vector is constant between revolutions:
@@ -281,7 +290,7 @@ int main(int argc, char **argv) {
  
           }
         } else {
-          RCLCPP_WARN(node->get_logger(), "LIDAR beam count: %d (it should be around average %d)", n_points, beam_count);
+          RCLCPP_WARN(node->get_logger(), "LIDAR beam count: %d (it should be around median %d)", n_points, beam_count);
         }
         break;
       }
