@@ -40,7 +40,9 @@ def generate_launch_description():
         {'angle_crop_min': 135.0},
         {'angle_crop_max': 225.0},
         {'min_intensity': 0},
-        {'do_filtering': True},
+        # The SDK near-point filter assumes the LD14's 2300 Hz measurement rate;
+        # at the LD19P's 5 kHz it deletes nearly every return beyond ~1.5 m.
+        {'do_filtering': False},
         {'do_triplets': False},
         # Motor speed gate: packets whose speed field is more than
         # speed_tolerance * nominal_speed_dps away from nominal are dropped, and

@@ -71,7 +71,7 @@ Parameters (set in the launch files):
 | `laser_scan_dir` | `true` | `true` = counter-clockwise |
 | `enable_angle_crop_func`, `angle_crop_min`, `angle_crop_max` | `false`, 135, 225 | zero out ranges inside the angle interval (degrees), e.g. where a robot body blocks the view |
 | `min_intensity` | 0 | drop returns with intensity below this value (noise on shiny or distant surfaces) |
-| `do_filtering` | `true` | the SDK's near-point filter |
+| `do_filtering` | `true` (LD14), `false` (LD14P/LD19P) | the SDK's near-point filter. It is tuned for the LD14's 2300 Hz measurement rate; on the LD19P (5 kHz) it deletes almost every return beyond ~1.5 m, so `ld14p.launch.py` turns it off |
 | `do_triplets` | `false` | average each three neighbouring beams into one, cutting the beam count by three |
 | `nominal_speed_dps` | 3600 | expected motor speed in degrees per second (10 Hz); 2160 for the LD14 |
 | `speed_tolerance` | 0.10 | drop packets whose speed is further than this fraction from nominal; 1.0 disables the gate |
