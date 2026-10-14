@@ -69,7 +69,7 @@ Parameters (set in the launch files):
 | `frame_id` | `base_laser` | frame of the published scans |
 | `laser_scan_topic_name`, `point_cloud_2d_topic_name` | `scan`, `pointcloud2d` | output topics |
 | `laser_scan_dir` | `true` | `true` = counter-clockwise |
-| `enable_angle_crop_func`, `angle_crop_min`, `angle_crop_max` | `false`, 135, 225 | zero out ranges inside the angle interval (degrees), e.g. where a robot body blocks the view |
+| `enable_angle_crop_func`, `angle_crop_min`, `angle_crop_max` | `false`, 135, 225 | zero out ranges inside the angle interval (lidar degrees, clockwise; in `/scan` at 360° minus these), e.g. where a robot body blocks the view. `ld14p.launch.py` takes them as the launch arguments `angle_crop`, `angle_crop_min`, `angle_crop_max` |
 | `min_intensity` | 0 | drop returns with intensity below this value (noise on shiny or distant surfaces) |
 | `do_filtering` | `true` (LD14), `false` (LD14P/LD19P) | the SDK's near-point filter. It is tuned for the LD14's 2300 Hz measurement rate; on the LD19P (5 kHz) it deletes almost every return beyond ~1.5 m, so `ld14p.launch.py` turns it off |
 | `do_triplets` | `false` | average each three neighbouring beams into one, cutting the beam count by three |
@@ -169,8 +169,24 @@ differ from the usual defaults:
   decides whether to process a scan by how far odometry says the sensor moved.
   With a static odom frame that is always zero, so the defaults would process
   the first scan and then nothing.
-- `minimum_time_interval` (0.2 s) paces scan processing instead, and the scan
-  matcher search window is widened to about ±0.3 m and ±30° per processed scan.
+- `minimum_time_interval` paces scan processing instead. It is 0, so every
+  scan is matched and each match only bridges 0.1 s of motion; the search
+  window is ±0.2 m and ±15° per scan.
+
+The person carrying the lidar takes up part of its view and moves with it,
+which tells the scan matcher that the lidar is standing still. On a recorded
+walk 89–97% of the beams between 160° and 240° in `/scan` hit the carrier, and
+the maps came out with doubled, rotated walls. `slam_ld14p.launch.py`
+therefore blanks that sector by default using the driver's angle crop:
+
+```bash
+ros2 launch ldlidar_sl_ros2 slam_ld14p.launch.py body_crop:=false   # keep the full view
+ros2 launch ldlidar_sl_ros2 slam_ld14p.launch.py body_crop_min:=100.0 body_crop_max:=220.0
+```
+
+`body_crop_min`/`body_crop_max` are lidar angles (clockwise, decimals
+required); in `/scan` the sector shows up at 360° minus those values. Hold
+the lidar so that you are behind it, i.e. in that sector.
 
 ### Running it
 
@@ -190,23 +206,30 @@ ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data:
 ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: '/home/me/maps/room'}"
 ```
 
-### Result of a first walkthrough
+### Results
 
-Three rooms of a flat, lidar carried by hand, no odometry, no IMU:
+A flat with three rooms and a hall, lidar carried by hand, no odometry, no
+IMU. The same recorded walk, replayed through slam_toolbox, with the carrier's
+body blanked out of the scan (`body_crop`, the default) and the settings in
+`config/slam_toolbox_ld14p.yaml`:
 
-![Occupancy grid from a hand-carried walkthrough](docs/slam_walkthrough_map.png)
+![Occupancy grid from a hand-carried walkthrough, carrier blanked out](docs/slam_walkthrough_map_body_crop.png)
 
-The rooms come out with straight walls and the right proportions, but the
-transitions between them show the limits of odometry-free scan matching: where
-the lidar was turned quickly in a doorway the matcher lost track for a moment,
-so some walls appear twice and the rooms are slightly rotated against each
-other. The stray grey wedges are floor hits from tilting the lidar.
+All walls come out parallel, the proportions are right, and a cupboard
+between two rooms is visible. Replaying the same walk several times gave the
+same map each time.
 
-Both problems come from the missing motion prior. The next step is an IMU
-mounted on the lidar: its gyro gives slam_toolbox the rotation between scans,
-which removes the doubled walls, and its roll and pitch allow tilted scans to be
-dropped or projected back onto the horizontal plane. A gimbal would only solve
-the tilt, so the IMU is the better investment, and it carries over to a robot.
+An earlier walk, before the carrier was blanked out (and with the old
+settings), for comparison:
+
+![Occupancy grid from an earlier walkthrough, without body_crop](docs/slam_walkthrough_map.png)
+
+There some walls appear twice and the rooms are rotated against each other:
+the carrier, moving with the lidar, made the scan matcher believe the lidar
+was not moving. The stray grey wedges in both maps are floor hits from
+tilting the lidar. An IMU mounted on the lidar would help with what is left:
+its gyro gives slam_toolbox the rotation between scans, and its roll and pitch
+allow tilted scans to be dropped or projected back onto the horizontal plane.
 
 ## License
 

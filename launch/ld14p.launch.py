@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 '''
@@ -22,6 +24,19 @@ Parameter Description:
 '''
 
 def generate_launch_description():
+  # The angle crop is exposed as launch arguments so that slam_ld14p.launch.py
+  # can mask out the person carrying the lidar. Angles are the lidar's own,
+  # clockwise from its zero mark; in /scan (counter-clockwise) a cropped angle
+  # a appears at 360 - a.
+  crop_args = [
+      DeclareLaunchArgument('angle_crop', default_value='false',
+                            description='Blank out the angle_crop_min..angle_crop_max sector'),
+      DeclareLaunchArgument('angle_crop_min', default_value='135.0',
+                            description='Start of the blanked sector, lidar degrees (clockwise)'),
+      DeclareLaunchArgument('angle_crop_max', default_value='225.0',
+                            description='End of the blanked sector, lidar degrees (clockwise)'),
+  ]
+
   # LDROBOT LiDAR publisher node
   ldlidar_node = Node(
       package='ldlidar_sl_ros2',
@@ -36,9 +51,9 @@ def generate_launch_description():
         {'port_name': '/dev/ttyUSB0'},
         {'serial_baudrate' : 230400}, # LD-19P also has 230400 baud rate
         {'laser_scan_dir': True},
-        {'enable_angle_crop_func': False},
-        {'angle_crop_min': 135.0},
-        {'angle_crop_max': 225.0},
+        {'enable_angle_crop_func': LaunchConfiguration('angle_crop')},
+        {'angle_crop_min': LaunchConfiguration('angle_crop_min')},
+        {'angle_crop_max': LaunchConfiguration('angle_crop_max')},
         {'min_intensity': 0},
         # The SDK near-point filter assumes the LD14's 2300 Hz measurement rate;
         # at the LD19P's 5 kHz it deletes nearly every return beyond ~1.5 m.
@@ -64,7 +79,7 @@ def generate_launch_description():
 
 
   # Define LaunchDescription variable
-  ld = LaunchDescription()
+  ld = LaunchDescription(crop_args)
 
   ld.add_action(ldlidar_node)
   ld.add_action(base_link_to_laser_tf_node)

@@ -7,9 +7,17 @@
 #     "has the robot moved enough" test, which looks at the (static) odom pose,
 #     would reject every scan after the first one.
 #   * minimum_time_interval is what actually paces scan processing instead.
+#     It is 0: every scan is matched, so each match only has to bridge 0.1 s of
+#     motion.
 # The scan matcher searches +-correlation_search_space_dimension/2 metres and
 # +-coarse_search_angle_offset radians around the previous pose, so move at a
 # slow walking pace and turn slowly.
+#
+# Tuned by replaying a recorded walk (three rooms and a hall) through
+# slam_toolbox with different settings. By far the largest effect was not a
+# parameter here but blanking the carrier's body out of the scan, which
+# slam_ld14p.launch.py does (body_crop). With that, every scan + the narrower
+# window below gave the cleanest maps, consistently over repeated replays.
 slam_toolbox:
   ros__parameters:
     solver_plugin: solver_plugins::CeresSolver
@@ -34,7 +42,7 @@ slam_toolbox:
     restamp_tf: false
     min_laser_range: 0.15        # must be above the driver range_min (0.1) or slam_toolbox warns
     max_laser_range: 12.0        # LIDAR_RANGE_MAX in the driver
-    minimum_time_interval: 0.2   # the lidar publishes 10 scans/s; process every other scan
+    minimum_time_interval: 0.0   # match every scan (the lidar publishes 10/s)
     transform_timeout: 0.2
     tf_buffer_duration: 30.0
     stack_size_to_use: 40000000
@@ -56,9 +64,10 @@ slam_toolbox:
     loop_match_minimum_response_coarse: 0.35
     loop_match_minimum_response_fine: 0.45
 
-    # Search window per processed scan (+-0.3 m, +-30 deg): a bit wider than
-    # the defaults because there is no odometry hint at all.
-    correlation_search_space_dimension: 0.6
+    # Search window per processed scan (+-0.2 m, +-15 deg). With every scan
+    # matched that covers a brisk walk and a fast turn, and in repeated replays
+    # it gave cleaner maps than the wider 0.6 m / +-30 deg window.
+    correlation_search_space_dimension: 0.4
     correlation_search_space_resolution: 0.01
     correlation_search_space_smear_deviation: 0.1
 
@@ -69,7 +78,7 @@ slam_toolbox:
     distance_variance_penalty: 0.5
     angle_variance_penalty: 1.0
     fine_search_angle_offset: 0.00349
-    coarse_search_angle_offset: 0.524
+    coarse_search_angle_offset: 0.262
     coarse_angle_resolution: 0.0349
     minimum_angle_penalty: 0.9
     minimum_distance_penalty: 0.5

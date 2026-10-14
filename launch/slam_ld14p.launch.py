@@ -7,6 +7,11 @@ requirements are met and all motion ends up in map -> odom.
 
     ros2 launch ldlidar_sl_ros2 slam_ld14p.launch.py            # with RViz
     ros2 launch ldlidar_sl_ros2 slam_ld14p.launch.py rviz:=false
+
+The person carrying the lidar fills part of its view and moves with it, which
+tells the scan matcher that the lidar is not moving. The sector behind the
+carrier is therefore blanked by default (body_crop:=false turns that off;
+body_crop_min/max are in lidar degrees, clockwise, see ld14p.launch.py).
 """
 import os
 from ament_index_python.packages import get_package_share_directory
@@ -56,9 +61,23 @@ def generate_launch_description():
       default_value=os.path.join(share, 'config', 'slam_toolbox_ld14p.yaml'),
       description='slam_toolbox parameter file')
 
+  # Default sector: measured on a hand-carried walk, where 89-97% of the beams
+  # between 160 and 240 deg in /scan (120-200 deg lidar angle) hit the carrier.
+  crop_args = [
+      DeclareLaunchArgument('body_crop', default_value='true',
+                            description='Blank out the sector where the carrier is'),
+      DeclareLaunchArgument('body_crop_min', default_value='120.0',
+                            description='Start of the blanked sector, lidar degrees (clockwise)'),
+      DeclareLaunchArgument('body_crop_max', default_value='200.0',
+                            description='End of the blanked sector, lidar degrees (clockwise)'),
+  ]
+
   # Lidar driver + base_link -> base_laser static transform
   ldlidar_launch = IncludeLaunchDescription(
-      PythonLaunchDescriptionSource([share, '/launch/ld14p.launch.py']))
+      PythonLaunchDescriptionSource([share, '/launch/ld14p.launch.py']),
+      launch_arguments={'angle_crop': LaunchConfiguration('body_crop'),
+                        'angle_crop_min': LaunchConfiguration('body_crop_min'),
+                        'angle_crop_max': LaunchConfiguration('body_crop_max')}.items())
 
   # No odometry source: odom and base_link coincide.
   odom_tf = Node(
@@ -101,6 +120,8 @@ def generate_launch_description():
     ld.add_action(action)
   ld.add_action(rviz_arg)
   ld.add_action(params_arg)
+  for action in crop_args:
+    ld.add_action(action)
   ld.add_action(ldlidar_launch)
   ld.add_action(odom_tf)
   ld.add_action(slam_node)
