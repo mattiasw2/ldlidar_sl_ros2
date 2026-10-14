@@ -39,6 +39,19 @@ echo "source ~/ldlidar_ws/install/setup.bash" >> ~/.bashrc
 Runtime dependencies beyond the ROS 2 base install: `rviz2`, `tf2_ros`,
 `slam_toolbox` (SLAM only). On Ubuntu: `sudo apt install ros-$ROS_DISTRO-slam-toolbox`.
 
+On a fresh Ubuntu with ROS 2 Lyrical, `scripts/setup_lidar_pc.sh` does all of
+the above in one go: ROS 2 and slam_toolbox from apt, serial port access and
+the udev rule (one sudo prompt), the workspace with this repo symlinked into
+it, and the build. It prints aliases for the helper scripts:
+
+| Script | What it does |
+|---|---|
+| `scripts/run_lidar.sh` | driver + RViz; `headless`, `slam`, `slam headless`, `save-map NAME` |
+| `scripts/scan_map.sh [NAME] [--rviz]` | interactive mapping: key to start, walk, key to stop; saves the map and records the raw scans, see [Mapping and tuning](#mapping-and-tuning-with-recorded-walks) |
+
+The scripts expect the workspace at `~/ldlidar_ws`; set `LDLIDAR_WS` to use
+another one.
+
 ## Running the driver
 
 | Launch file | What it starts |
@@ -230,6 +243,30 @@ was not moving. The stray grey wedges in both maps are floor hits from
 tilting the lidar. An IMU mounted on the lidar would help with what is left:
 its gyro gives slam_toolbox the rotation between scans, and its roll and pitch
 allow tilted scans to be dropped or projected back onto the horizontal plane.
+
+### Mapping and tuning with recorded walks
+
+`scripts/scan_map.sh` runs the SLAM launch, waits for a key press while you
+walk, then saves `NAME.pgm/.yaml` and `NAME.posegraph/.data` (default
+`~/maps/map_<date_time>`). It also records the raw `/scan` topic to
+`NAME.bag/`, so the same walk can be mapped again with other settings,
+without walking again:
+
+```bash
+cd scripts/slam_replay
+# one replay per settings file, each in its own ROS domain, in parallel
+./replay.sh ~/maps/map_X.bag ~/tune/wide.yaml  ~/tune/out_wide  61 &
+./replay.sh ~/maps/map_X.bag ~/tune/tight.yaml ~/tune/out_tight 62 &
+wait
+python3 map_sheet.py ~/tune/sheet.png wide=$HOME/tune/out_wide.pgm tight=$HOME/tune/out_tight.pgm
+# try a different body_crop sector on the recording (angles as seen in /scan)
+python3 crop_bag.py ~/maps/map_X.bag ~/tune/cropped.bag 160 240
+```
+
+slam_toolbox does not produce identical maps from identical input, so repeat
+a promising variant two or three times before trusting a difference. The
+settings in `config/slam_toolbox_ld14p.yaml` and the default `body_crop`
+sector were chosen this way.
 
 ## License
 
