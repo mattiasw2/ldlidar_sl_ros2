@@ -21,19 +21,26 @@
 #include "ros2_api.h"
 #include "ldlidar_driver.h"
 
+// Host steady clock in nanoseconds. The driver stamps every point with it.
 uint64_t GetTimestamp(void);
-
-// Optional - For rviz2: time shift corrections
-#define TIME_SHIFT_SEC 0
-#define TIME_SHIFT_NSEC 400000000
 
 #define LIDAR_RANGE_MIN 0.1
 #define LIDAR_RANGE_MAX 12.0
 
-void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq, LaserScanSetting& setting,
+// Point stamps are on the steady clock; ROS time = steady time + this offset,
+// re-measured once per revolution.
+struct ScanClock {
+  int64_t steady_to_ros_ns;
+  rcl_clock_type_t clock_type;
+  rclcpp::Time ToRos(uint64_t steady_ns) const {
+    return rclcpp::Time(static_cast<int64_t>(steady_ns) + steady_to_ros_ns, clock_type);
+  }
+};
+
+void  ToLaserscanMessagePublish(ldlidar::Points2D& src, const ScanClock& clock, LaserScanSetting& setting,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr& lidarpub);
 
-void  ToSensorPointCloudMessagePublish(ldlidar::Points2D& src, LaserScanSetting& setting,
+void  ToSensorPointCloudMessagePublish(ldlidar::Points2D& src, const ScanClock& clock, LaserScanSetting& setting,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& lidarpub);
 
 int main(int argc, char **argv) {
@@ -56,6 +63,9 @@ int main(int argc, char **argv) {
   int serial_baudrate = 0;
   bool do_filtering = true;
   setting.do_triplets = false;
+  double nominal_speed_dps = 3600.0;  // LD14P / LD19P: 10 revolutions per second
+  double speed_tolerance = 0.10;
+  double settle_time_s = 1.0;
   
   ldlidar::LDType lidartypename = ldlidar::LDType::NO_VER;
 
@@ -77,6 +87,9 @@ int main(int argc, char **argv) {
   node->declare_parameter<int>("min_intensity", setting.min_intensity);
   node->declare_parameter<bool>("do_filtering", do_filtering);
   node->declare_parameter<bool>("do_triplets", setting.do_triplets);
+  node->declare_parameter<double>("nominal_speed_dps", nominal_speed_dps);
+  node->declare_parameter<double>("speed_tolerance", speed_tolerance);
+  node->declare_parameter<double>("settle_time_s", settle_time_s);
 
   // get ros2 param
   node->get_parameter("product_name", product_name);
@@ -92,6 +105,9 @@ int main(int argc, char **argv) {
   node->get_parameter("min_intensity", setting.min_intensity);
   node->get_parameter("do_filtering", do_filtering); // use Points2D Slbf::NearFilter
   node->get_parameter("do_triplets", setting.do_triplets); // combine beams into triplets, cut beams count by three
+  node->get_parameter("nominal_speed_dps", nominal_speed_dps);
+  node->get_parameter("speed_tolerance", speed_tolerance);
+  node->get_parameter("settle_time_s", settle_time_s);
 
   ldlidar::LDLidarDriver* lidar_drv = new ldlidar::LDLidarDriver();
 
@@ -109,6 +125,9 @@ int main(int argc, char **argv) {
   RCLCPP_INFO(node->get_logger(), "<min_intensity>: %d ", setting.min_intensity);
   RCLCPP_INFO(node->get_logger(), "<do_filtering>: %d ", do_filtering);
   RCLCPP_INFO(node->get_logger(), "<do_triplets>: %d ", setting.do_triplets);
+  RCLCPP_INFO(node->get_logger(), "<nominal_speed_dps>: %.0f ", nominal_speed_dps);
+  RCLCPP_INFO(node->get_logger(), "<speed_tolerance>: %.2f ", speed_tolerance);
+  RCLCPP_INFO(node->get_logger(), "<settle_time_s>: %.2f ", settle_time_s);
 
   if (port_name.empty()) {
     RCLCPP_ERROR(node->get_logger(), "fail, port_name is empty!");
@@ -116,6 +135,7 @@ int main(int argc, char **argv) {
   }
 
   lidar_drv->RegisterGetTimestampFunctional(std::bind(&GetTimestamp)); 
+  lidar_drv->SetSpeedGate(nominal_speed_dps, speed_tolerance, settle_time_s);
 
   // make sure: .../ldlidar_driver/src/lipkg.cpp:224 - commented out exclusion of LD_14P_* in the if statement
   lidar_drv->EnableFilterAlgorithnmProcess(do_filtering);
@@ -123,7 +143,10 @@ int main(int argc, char **argv) {
   if(!strcmp(product_name.c_str(), "LDLiDAR_LD14")) {
     lidartypename = ldlidar::LDType::LD_14;
   } else if(!strcmp(product_name.c_str(), "LDLiDAR_LD14P")) {
-    lidartypename = ldlidar::LDType::LD_14P_4000HZ;  // the measurement frequency of lidar is 4kHz.
+    // Nominal measurement frequency, only used for plausibility limits. Point
+    // timing is derived from each packet's angle span and speed instead, so
+    // the LD19P's actual 5 kHz is handled correctly.
+    lidartypename = ldlidar::LDType::LD_14P_4000HZ;
   } else {
     RCLCPP_ERROR(node->get_logger(),"Error, input param <product_name> is fail!!");
     exit(EXIT_FAILURE);
@@ -150,20 +173,49 @@ int main(int argc, char **argv) {
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_pub_pointcloud = 
       node->create_publisher<sensor_msgs::msg::PointCloud2>(point_cloud_2d_topic_name, 10);
 
-  rclcpp::WallRate r(6); //Hz
-
   ldlidar::Points2D laser_scan_points_raw;
   ldlidar::Points2D laser_scan_points;
 
+  uint64_t gate_dropped_reported = 0;
+  rclcpp::Time gate_last_warn(0, 0, node->get_clock()->get_clock_type());
+
   RCLCPP_INFO(node->get_logger(), "start normal, pub lidar data");
 
+  // No fixed publish rate: GetLaserScanData blocks until the driver has
+  // assembled the next revolution, so every revolution is published once.
   while (rclcpp::ok() && ldlidar::LDLidarDriver::IsOk()) {
+
+    // Speed gate report: at most one warning per 5 s, and only when the drop
+    // count changed since the last report, so the final count after a stall
+    // is always reported once.
+    ldlidar::LiPkg::SpeedGateStats gate = lidar_drv->GetSpeedGateStats();
+    uint64_t gate_dropped = gate.dropped_out_of_tolerance + gate.dropped_settling;
+    if ((gate_dropped != gate_dropped_reported) &&
+        ((node->now() - gate_last_warn).seconds() >= 5.0)) {
+      gate_last_warn = node->now();
+      RCLCPP_WARN(node->get_logger(),
+        "speed gate: dropped %lu packets so far (%lu speed out of tolerance, %lu settling), "
+        "last speed %.0f deg/s, nominal %.0f +-%.0f%%, %s",
+        static_cast<unsigned long>(gate_dropped),
+        static_cast<unsigned long>(gate.dropped_out_of_tolerance),
+        static_cast<unsigned long>(gate.dropped_settling),
+        gate.last_speed_dps, nominal_speed_dps, speed_tolerance * 100.0,
+        gate.settled ? "accepting data again" : "waiting for the speed to settle");
+      gate_dropped_reported = gate_dropped;
+    }
   
     switch (lidar_drv->GetLaserScanData(laser_scan_points_raw, 1500)){
       case ldlidar::LidarStatus::NORMAL: {
-        double lidar_scan_freq = 0;
-        lidar_drv->GetLidarScanFreq(lidar_scan_freq);
         int n_points = static_cast<int>(laser_scan_points_raw.size());
+
+        // Map the point stamps (steady clock) to ROS time, once per revolution.
+        ScanClock scan_clock;
+        {
+          rclcpp::Time ros_now = node->now();
+          uint64_t steady_now = GetTimestamp();
+          scan_clock.steady_to_ros_ns = static_cast<int64_t>(ros_now.nanoseconds()) - static_cast<int64_t>(steady_now);
+          scan_clock.clock_type = ros_now.get_clock_type();
+        }
 
         int n_samples = 20;
         if(beam_count_i++ < n_samples) {
@@ -219,13 +271,13 @@ int main(int argc, char **argv) {
 
             //RCLCPP_INFO(node->get_logger(), "LIDAR beam count: %d  %d  %d", beam_count, static_cast<int>(laser_scan_points_raw.size()), static_cast<int>(laser_scan_points.size()));
 
-            ToLaserscanMessagePublish(laser_scan_points, lidar_scan_freq, setting, node, lidar_pub_laserscan);
-            ToSensorPointCloudMessagePublish(laser_scan_points, setting, node, lidar_pub_pointcloud);
+            ToLaserscanMessagePublish(laser_scan_points, scan_clock, setting, node, lidar_pub_laserscan);
+            ToSensorPointCloudMessagePublish(laser_scan_points, scan_clock, setting, node, lidar_pub_pointcloud);
 
           } else {
  
-            ToLaserscanMessagePublish(laser_scan_points_raw, lidar_scan_freq, setting, node, lidar_pub_laserscan);
-            ToSensorPointCloudMessagePublish(laser_scan_points_raw, setting, node, lidar_pub_pointcloud);
+            ToLaserscanMessagePublish(laser_scan_points_raw, scan_clock, setting, node, lidar_pub_laserscan);
+            ToSensorPointCloudMessagePublish(laser_scan_points_raw, scan_clock, setting, node, lidar_pub_pointcloud);
  
           }
         } else {
@@ -244,8 +296,6 @@ int main(int argc, char **argv) {
       default:
         break;
     }
-
-    r.sleep();
   }
 
   lidar_drv->Stop();
@@ -260,49 +310,66 @@ int main(int argc, char **argv) {
 }
 
 uint64_t GetTimestamp(void) {
-  std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds> tp = 
-    std::chrono::time_point_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now());
-  auto tmp = std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch());
+  auto tmp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch());
   return ((uint64_t)tmp.count());
 }
 
-void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq, LaserScanSetting& setting,
+// Earliest and latest point stamp of a revolution (steady clock, ns).
+static void ScanTimeSpan(const ldlidar::Points2D& src, uint64_t& first_ns, uint64_t& last_ns) {
+  first_ns = UINT64_MAX;
+  last_ns = 0;
+  for (const auto& point : src) {
+    if (point.stamp < first_ns) first_ns = point.stamp;
+    if (point.stamp > last_ns) last_ns = point.stamp;
+  }
+  if (first_ns == UINT64_MAX) {
+    first_ns = 0;
+  }
+}
+
+void  ToLaserscanMessagePublish(ldlidar::Points2D& src, const ScanClock& clock, LaserScanSetting& setting,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr& lidarpub) {
   float angle_min, angle_max, angle_increment;
-  double scan_time;
-  rclcpp::Time start_scan_time;
-  static rclcpp::Time end_scan_time;
-  static bool first_scan = true;
 
-  start_scan_time = node->now();
-  scan_time = (start_scan_time.seconds() - end_scan_time.seconds());
-
-  if (first_scan) {
-    first_scan = false;
-    end_scan_time = start_scan_time;
+  int beam_size = static_cast<int>(src.size());
+  if (beam_size <= 1) {
     return;
   }
+
   // Adjust the parameters according to the demand
   angle_min = 0;
   angle_max = (2 * M_PI);
-  int beam_size = static_cast<int>(src.size());
   angle_increment = (angle_max - angle_min) / (float)(beam_size -1);
-  // Calculate the number of scanning points
-  if (lidar_spin_freq > 0) {
+
+  // Timing. Every point carries the time it was measured. The lidar rotates
+  // clockwise, so with laser_scan_dir = true (counter-clockwise beam order,
+  // the ROS convention) beam 0 is the LAST point measured and the beams run
+  // backwards in time: header.stamp is the time of beam 0 and time_increment
+  // is negative, so that beam i was measured at stamp + i * time_increment.
+  // With laser_scan_dir = false beam 0 is the first point measured and
+  // time_increment is positive. scan_time is the duration of the revolution.
+  uint64_t first_ns, last_ns;
+  ScanTimeSpan(src, first_ns, last_ns);
+  double scan_time = static_cast<double>(last_ns - first_ns) / 1e9;
+  double time_increment = scan_time / (double)(beam_size - 1);
+
+  {
     sensor_msgs::msg::LaserScan output;
-    output.header.stamp = start_scan_time;
+    if (setting.laser_scan_dir) {
+      output.header.stamp = clock.ToRos(last_ns);
+      output.time_increment = static_cast<float>(-time_increment);
+    } else {
+      output.header.stamp = clock.ToRos(first_ns);
+      output.time_increment = static_cast<float>(time_increment);
+    }
+    output.scan_time = static_cast<float>(scan_time);
     output.header.frame_id = setting.frame_id;
     output.angle_min = angle_min;
     output.angle_max = angle_max;
     output.range_min = LIDAR_RANGE_MIN;
     output.range_max = LIDAR_RANGE_MAX;
     output.angle_increment = angle_increment;
-    if (beam_size <= 1) {
-      output.time_increment = 0;
-    } else {
-      output.time_increment = static_cast<float>(scan_time / (double)(beam_size - 1));
-    }
-    output.scan_time = scan_time;
     // First fill all the data with Nan
     output.ranges.assign(beam_size, std::numeric_limits<float>::quiet_NaN());
     output.intensities.assign(beam_size, std::numeric_limits<float>::quiet_NaN());
@@ -362,14 +429,17 @@ void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq,
       }
     }
     lidarpub->publish(output);
-    end_scan_time = start_scan_time;
   } 
 }
 
-void  ToSensorPointCloudMessagePublish(ldlidar::Points2D& src, LaserScanSetting& setting,
+void  ToSensorPointCloudMessagePublish(ldlidar::Points2D& src, const ScanClock& clock, LaserScanSetting& setting,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& lidarpub) {
-  
-  rclcpp::Time start_scan_time = node->now();
+  (void)node;
+
+  // The cloud is stamped with the time of its earliest point.
+  uint64_t first_ns, last_ns;
+  ScanTimeSpan(src, first_ns, last_ns);
+  rclcpp::Time start_scan_time = clock.ToRos(first_ns);
 
   ldlidar::Points2D dst = src;
 
@@ -387,7 +457,6 @@ void  ToSensorPointCloudMessagePublish(ldlidar::Points2D& src, LaserScanSetting&
   sensor_msgs::msg::PointCloud2 output;
 
   output.header.stamp = start_scan_time;
-  //output.header.stamp = start_scan_time - rclcpp::Duration(TIME_SHIFT_SEC, TIME_SHIFT_NSEC);
   output.header.frame_id = setting.frame_id;
 
   // Unordered 2D cloud: one row, frame_points_num columns, fields x y z intensity (float32 each)

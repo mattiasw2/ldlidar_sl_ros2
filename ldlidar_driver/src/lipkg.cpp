@@ -19,6 +19,11 @@
  * limitations under the License.
  */
 #include "lipkg.h"
+
+#include <math.h>
+
+#include <algorithm>
+
 namespace ldlidar {
 
 static const uint8_t CrcTable[256] = {
@@ -66,7 +71,19 @@ LiPkg::LiPkg()
     get_timestamp_(nullptr),
     is_poweron_comm_normal_(false),
     poweron_datapkg_count_(0),
-    last_pkg_timestamp_(0) {
+    last_pkg_timestamp_(0),
+    have_last_raw_ts_(false),
+    last_raw_ts_(0),
+    lidar_ms_base_(0),
+    gate_nominal_dps_(3600.0),
+    gate_tolerance_(0.10),
+    gate_settle_ns_(1000000000ULL),
+    gate_ok_since_ns_(0),
+    gate_settled_(false),
+    gate_dropped_out_of_tolerance_(0),
+    gate_dropped_settling_(0),
+    gate_settled_flag_(false),
+    last_packet_time_ns_(0) {
 
 }
 
@@ -96,6 +113,80 @@ void LiPkg::SetNoiseFilter(bool is_enable) {
 
 void LiPkg::RegisterTimestampGetFunctional(std::function<uint64_t(void)> timestamp_handle) {
   get_timestamp_ = timestamp_handle;
+}
+
+void LiPkg::SetSpeedGate(double nominal_dps, double tolerance, double settle_s) {
+  gate_nominal_dps_ = nominal_dps;
+  gate_tolerance_ = tolerance;
+  gate_settle_ns_ = (settle_s > 0) ? static_cast<uint64_t>(settle_s * 1e9) : 0;
+  gate_ok_since_ns_ = 0;
+  gate_settled_ = false;
+  gate_settled_flag_ = false;
+}
+
+LiPkg::SpeedGateStats LiPkg::GetSpeedGateStats(void) {
+  SpeedGateStats st;
+  st.dropped_out_of_tolerance = gate_dropped_out_of_tolerance_.load();
+  st.dropped_settling = gate_dropped_settling_.load();
+  st.last_speed_dps = speed_.load();
+  st.settled = gate_settled_flag_.load();
+  return st;
+}
+
+uint64_t LiPkg::GetLastPacketTime(void) {
+  return last_packet_time_ns_.load();
+}
+
+uint64_t LiPkg::UnwrapLidarTimestamp(uint16_t raw_ms) {
+  if (have_last_raw_ts_ && (raw_ms < last_raw_ts_)) {
+    // The vendor manual says the counter resets when it reaches 30000 ms.
+    // Should a unit ever count beyond that, treat it as a plain 16 bit wrap.
+    lidar_ms_base_ += (last_raw_ts_ < kLidarTimestampWrapMs) ? kLidarTimestampWrapMs : 65536;
+  }
+  have_last_raw_ts_ = true;
+  last_raw_ts_ = raw_ms;
+  return (lidar_ms_base_ + raw_ms) * 1000000ULL;
+}
+
+int64_t LiPkg::UpdateClockOffset(uint64_t lidar_ns, uint64_t host_rx_ns) {
+  // offset = host receive time - lidar time. USB and scheduling latency only
+  // ever make it larger, so the minimum over a sliding window is the best
+  // estimate of the true offset. Kept as a monotonic deque: offsets increase
+  // from front to back, so the front is the window minimum.
+  int64_t offset = static_cast<int64_t>(host_rx_ns) - static_cast<int64_t>(lidar_ns);
+  while (!offset_window_.empty() && (offset_window_.back().offset_ns >= offset)) {
+    offset_window_.pop_back();
+  }
+  offset_window_.push_back(OffsetSample{lidar_ns, offset});
+  while (!offset_window_.empty() &&
+         (offset_window_.front().lidar_ns + kOffsetWindowNs < lidar_ns)) {
+    offset_window_.pop_front();
+  }
+  return offset_window_.front().offset_ns;
+}
+
+bool LiPkg::SpeedGateAccepts(double speed_dps, uint64_t host_rx_ns) {
+  bool in_tolerance = fabs(speed_dps - gate_nominal_dps_) <= (gate_tolerance_ * gate_nominal_dps_);
+  if (!in_tolerance) {
+    gate_dropped_out_of_tolerance_++;
+    gate_ok_since_ns_ = 0;
+    gate_settled_ = false;
+    gate_settled_flag_ = false;
+    return false;
+  }
+  if (gate_settled_) {
+    return true;
+  }
+  if (0 == gate_ok_since_ns_) {
+    gate_ok_since_ns_ = host_rx_ns;
+  }
+  if ((host_rx_ns - gate_ok_since_ns_) < gate_settle_ns_) {
+    gate_dropped_settling_++;
+    return false;
+  }
+  gate_settled_ = true;
+  gate_settled_flag_ = true;
+  return true;
 }
 
 bool LiPkg::AnalysisOne(uint8_t byte) {
@@ -149,6 +240,10 @@ bool LiPkg::AnalysisOne(uint8_t byte) {
 bool LiPkg::Parse(const uint8_t *data, long len) {
   for (int i = 0; i < len; i++) {
     if (AnalysisOne(data[i])) {
+      uint64_t host_rx_ns = get_timestamp_();
+      last_packet_time_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+
       poweron_datapkg_count_++;
       if (poweron_datapkg_count_ >= 2) {
         poweron_datapkg_count_ = 0;
@@ -157,35 +252,53 @@ bool LiPkg::Parse(const uint8_t *data, long len) {
       
       speed_ = datapkg_.speed;
       timestamp_ = datapkg_.timestamp;
+
+      // Keep the lidar clock mapping running on every packet so that the
+      // offset estimate is ready as soon as the speed gate opens.
+      uint64_t lidar_ns = UnwrapLidarTimestamp(datapkg_.timestamp);
+      int64_t offset_ns = UpdateClockOffset(lidar_ns, host_rx_ns);
+
+      if (!SpeedGateAccepts(datapkg_.speed, host_rx_ns)) {
+        // Bad speed means the angles inside the partial revolution are not
+        // trustworthy either: start the revolution over.
+        frame_tmp_.clear();
+        continue;
+      }
       
       // parse a package is success
       double diff = (datapkg_.end_angle / 100 - datapkg_.start_angle / 100 + 360) % 360;
-      if (diff <= ((double)datapkg_.speed * POINT_PER_PACK / lidar_measure_freq_ * 1.5)) {
+      if (diff <= ((double)datapkg_.speed * (double)POINT_PER_PACK / lidar_measure_freq_ * 1.5)) {
+        // Packet time on the host clock. The vendor manual only says the
+        // field is "the timestamp of the data packet"; it is taken to mark
+        // the last measurement, the moment the packet is complete.
+        uint64_t pkg_host_ns = static_cast<uint64_t>(static_cast<int64_t>(lidar_ns) + offset_ns);
 
-        if (0 == last_pkg_timestamp_) {
-          last_pkg_timestamp_ = get_timestamp_();
+        uint32_t span = ((uint32_t)datapkg_.end_angle + 36000 - (uint32_t)datapkg_.start_angle) % 36000;
+        // Time between the 12 measurements: the packet covers span degrees at
+        // speed deg/s. This follows the real measurement rate (5 kHz on the
+        // LD19P, 4 kHz on the LD14P) without having to know it.
+        double pkg_duration_s;
+        if (datapkg_.speed > 0) {
+          pkg_duration_s = (span / 100.0) / (double)datapkg_.speed;
         } else {
-          uint64_t current_pack_stamp = get_timestamp_();
-          int pkg_point_number = POINT_PER_PACK;
-          double pack_stamp_point_step =  
-              static_cast<double>(current_pack_stamp - last_pkg_timestamp_) / static_cast<double>(pkg_point_number - 1);
-          
-          uint32_t diff = ((uint32_t)datapkg_.end_angle + 36000 - (uint32_t)datapkg_.start_angle) % 36000;
-          float step = diff / (POINT_PER_PACK - 1) / 100.0;
-          float start = (double)datapkg_.start_angle / 100.0;
-          PointData data;
-          for (int i = 0; i < POINT_PER_PACK; i++) {
-            data.distance = datapkg_.point[i].distance;
-            data.angle = start + i * step;
-            if (data.angle >= 360.0) {
-              data.angle -= 360.0;
-            }
-            data.intensity = datapkg_.point[i].intensity;
-            data.stamp = static_cast<uint64_t>(last_pkg_timestamp_ + (pack_stamp_point_step * i));
-            frame_tmp_.push_back(PointData(data.angle, data.distance, data.intensity, data.stamp));
-          }
-          last_pkg_timestamp_ = current_pack_stamp; //// update last pkg timestamp
+          pkg_duration_s = (double)(POINT_PER_PACK - 1) / (double)lidar_measure_freq_;
         }
+        double point_step_ns = pkg_duration_s * 1e9 / (double)(POINT_PER_PACK - 1);
+
+        float step = span / (POINT_PER_PACK - 1) / 100.0;
+        float start = (double)datapkg_.start_angle / 100.0;
+        PointData data;
+        for (int i = 0; i < POINT_PER_PACK; i++) {
+          data.distance = datapkg_.point[i].distance;
+          data.angle = start + i * step;
+          if (data.angle >= 360.0) {
+            data.angle -= 360.0;
+          }
+          data.intensity = datapkg_.point[i].intensity;
+          data.stamp = pkg_host_ns - static_cast<uint64_t>(point_step_ns * (POINT_PER_PACK - 1 - i));
+          frame_tmp_.push_back(PointData(data.angle, data.distance, data.intensity, data.stamp));
+        }
+        last_pkg_timestamp_ = pkg_host_ns;
       }
     }
   }
@@ -275,6 +388,19 @@ bool LiPkg::GetLaserScanData(Points2D& out) {
   }
 }
 
+bool LiPkg::WaitLaserScanData(Points2D& out, int timeout_ms) {
+  {
+    std::unique_lock<std::mutex> lk(mutex_lock1_);
+    if (!frame_ready_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                                  [this] { return is_frame_ready_; })) {
+      return false;
+    }
+    is_frame_ready_ = false;
+  }
+  out = GetLaserScanData();
+  return true;
+}
+
 double LiPkg::GetSpeed(void) { 
   return (speed_ / 360.0);  // unit  is Hz
 }
@@ -315,8 +441,11 @@ void LiPkg::ResetFrameReady(void) {
 }
 
 void LiPkg::SetFrameReady(void) {
-  std::lock_guard<std::mutex> lg(mutex_lock1_);
-  is_frame_ready_ = true;
+  {
+    std::lock_guard<std::mutex> lg(mutex_lock1_);
+    is_frame_ready_ = true;
+  }
+  frame_ready_cv_.notify_all();
 }
 
 void LiPkg::SetLaserScanData(Points2D& src) {

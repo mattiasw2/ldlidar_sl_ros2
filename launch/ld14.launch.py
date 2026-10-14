@@ -41,7 +41,14 @@ def generate_launch_description():
         {'angle_crop_max': 225.0},
         {'min_intensity': 0},
         {'do_filtering': True},
-        {'do_triplets': False}
+        {'do_triplets': False},
+        # Motor speed gate: packets whose speed field is more than
+        # speed_tolerance * nominal_speed_dps away from nominal are dropped, and
+        # data is only accepted again after settle_time_s of good speed.
+        # speed_tolerance 1.0 disables the gate.
+        {'nominal_speed_dps': 2160.0},  # LD14 spins at 6 Hz (vendor spec, untested here)
+        {'speed_tolerance': 0.10},
+        {'settle_time_s': 1.0}
       ]
   )
 

@@ -126,12 +126,21 @@ LidarStatus LDLidarDriver::GetLaserScanData(Points2D& dst, int64_t timeout) {
 
   LidarStatus status = comm_pkg_->GetLidarStatus();
   if (LidarStatus::NORMAL == status) {
-    if (comm_pkg_->GetLaserScanData(dst)) {
+    if (comm_pkg_->WaitLaserScanData(dst, 100)) {
       last_pubdata_times_ = std::chrono::steady_clock::now(); 
       return LidarStatus::NORMAL;
     }
-    
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_pubdata_times_).count() > timeout) {
+
+    // No revolution within 100 ms. Decide between "still talking to the
+    // lidar" and "lidar gone" from the last CRC-valid packet, whatever the
+    // speed gate did with it.
+    uint64_t last_pkg_ns = comm_pkg_->GetLastPacketTime();
+    uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    uint64_t last_pub_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        last_pubdata_times_.time_since_epoch()).count();
+    uint64_t last_alive_ns = (last_pkg_ns > last_pub_ns) ? last_pkg_ns : last_pub_ns;
+    if ((now_ns - last_alive_ns) > static_cast<uint64_t>(timeout) * 1000000ULL) {
       return LidarStatus::DATA_TIME_OUT;
     } else {
       return LidarStatus::DATA_WAIT;
@@ -148,6 +157,14 @@ bool  LDLidarDriver::GetLidarScanFreq(double& spin_hz) {
   }
   spin_hz = comm_pkg_->GetSpeed();
   return true;
+}
+
+void LDLidarDriver::SetSpeedGate(double nominal_dps, double tolerance, double settle_s) {
+  comm_pkg_->SetSpeedGate(nominal_dps, tolerance, settle_s);
+}
+
+LiPkg::SpeedGateStats LDLidarDriver::GetSpeedGateStats(void) {
+  return comm_pkg_->GetSpeedGateStats();
 }
 
 void LDLidarDriver::RegisterGetTimestampFunctional(std::function<uint64_t(void)> get_timestamp_handle) {

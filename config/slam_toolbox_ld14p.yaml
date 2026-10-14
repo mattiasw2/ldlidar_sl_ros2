@@ -34,7 +34,7 @@ slam_toolbox:
     restamp_tf: false
     min_laser_range: 0.15        # must be above the driver range_min (0.1) or slam_toolbox warns
     max_laser_range: 12.0        # LIDAR_RANGE_MAX in the driver
-    minimum_time_interval: 0.2   # LD14P spins at ~6-10 Hz; process every other scan
+    minimum_time_interval: 0.2   # the lidar publishes 10 scans/s; process every other scan
     transform_timeout: 0.2
     tf_buffer_duration: 30.0
     stack_size_to_use: 40000000

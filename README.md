@@ -11,8 +11,9 @@ support. On top of that this fork adds a `PointCloud2` output, launch files that
 survive snap-packaged terminals, and the SLAM configuration described below.
 
 Tested with an LD19P on Ubuntu 26.04 / ROS 2 lyrical. The LD19P runs at
-230400 baud and works with the `LDLiDAR_LD14P` product setting, so everything
-below that says LD14P applies to it as well.
+230400 baud, spins at 10 Hz, measures 5000 points per second, and works with
+the `LDLiDAR_LD14P` product setting, so everything below that says LD14P
+applies to it as well.
 
 ## Hardware setup
 
@@ -55,8 +56,8 @@ The driver publishes:
 
 | Topic / frame | Type | Notes |
 |---|---|---|
-| `/scan` | `sensor_msgs/LaserScan` | one message per revolution, about 6 Hz, ~500 beams, 0 to 2π counter-clockwise |
-| `/pointcloud2d` | `sensor_msgs/PointCloud2` | same points as `x`, `y`, `z`, `intensity` |
+| `/scan` | `sensor_msgs/LaserScan` | one message per revolution, 10 Hz, ~500 beams, 0 to 2π counter-clockwise, measured timing (see [Timing](#timing)) |
+| `/pointcloud2d` | `sensor_msgs/PointCloud2` | same points as `x`, `y`, `z`, `intensity`, stamped with the earliest point |
 | `base_link -> base_laser` | static TF | lidar 0.18 m above `base_link`; edit the launch file for your mount |
 
 Parameters (set in the launch files):
@@ -72,10 +73,57 @@ Parameters (set in the launch files):
 | `min_intensity` | 0 | drop returns with intensity below this value (noise on shiny or distant surfaces) |
 | `do_filtering` | `true` | the SDK's near-point filter |
 | `do_triplets` | `false` | average each three neighbouring beams into one, cutting the beam count by three |
+| `nominal_speed_dps` | 3600 | expected motor speed in degrees per second (10 Hz); 2160 for the LD14 |
+| `speed_tolerance` | 0.10 | drop packets whose speed is further than this fraction from nominal; 1.0 disables the gate |
+| `settle_time_s` | 1.0 | after start-up or any dropped packet, require this long of in-tolerance speed before accepting data |
 
 The beam count per revolution is measured over the first 20 revolutions and
 every later scan is padded or trimmed to that count. SLAM front-ends such as
 slam_toolbox reject scans whose beam count changes, so this matters.
+
+### Timing
+
+Every point is stamped with the time it was measured, so a scan taken while
+the lidar is moving can later be de-skewed with an IMU.
+
+Each packet from the lidar carries 12 measurements, the motor speed in degrees
+per second, the start and end angle, and a millisecond timestamp from the
+lidar's own clock that wraps at 30000. The driver unwraps that clock and maps it
+onto the host's steady clock: the offset is the minimum of
+`host receive time - lidar time` over a sliding 2 s window, which strips the
+USB and scheduling latency because latency only ever makes the offset larger.
+The vendor manual only says the field is "the timestamp of the data packet";
+the driver takes it as the time of the last of the 12 measurements, and spreads
+the earlier ones backwards by the packet's angle span divided by its speed. On
+the LD19P that is one measurement every 0.2 ms (5000 points per second).
+
+Once per revolution the node converts the point stamps to ROS time, and fills
+the `LaserScan` fields so that beam `i` was measured at
+`header.stamp + i * time_increment`:
+
+| Field | Value |
+|---|---|
+| `header.stamp` | time of beam 0 |
+| `time_increment` | negative with the default `laser_scan_dir: true`, because the lidar spins clockwise while ROS beams run counter-clockwise, so beam 0 is the last point of the revolution; positive with `laser_scan_dir: false` |
+| `scan_time` | duration of the revolution, about 0.1 s |
+
+Measured on an LD19P: 9.94 Hz on `/scan`, `scan_time` 0.099 to 0.101 s,
+`time_increment` -0.2 ms, and the header stamp 3 to 9 ms before the message
+arrives at a subscriber.
+
+### Motor speed gate
+
+The packet speed field is checked against `nominal_speed_dps`. A packet further
+than `speed_tolerance` from nominal is dropped together with the partial
+revolution it belongs to, and after start-up or any such drop the driver waits
+until the speed has been inside the band for `settle_time_s` before accepting
+data again. The default band of ±10 % is wide enough that the small speed
+changes from walking and turning never trip it, since that data is needed most
+during turns; it is meant for a stalled rotor, a motor spinning up, or a weak
+USB supply. Dropped packets are reported with a warning at most every 5 s,
+with the drop count and the last speed seen. A lidar that keeps sending
+packets with a bad speed does not time out the node, so the warnings stay
+visible until the motor recovers.
 
 ### Snap-packaged terminals
 

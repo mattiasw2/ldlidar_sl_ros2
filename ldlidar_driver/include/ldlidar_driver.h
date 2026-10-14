@@ -68,11 +68,14 @@ public:
   bool WaitLidarCommConnect(int64_t timeout = 1000);
 
   /**
-   * @brief get lidar laser scan point cloud data
+   * @brief get the next complete revolution. Blocks for up to 100 ms waiting
+   *        for one, so a caller looping on this publishes every revolution.
    * @param [output]
    * *@param dst: type is ldlidar::Point2D, value is laser scan point cloud data
    * @param [in]
-   * *@param timeout: Wait timeout, in milliseconds
+   * *@param timeout: time in milliseconds without any valid packet from the
+   *        lidar after which DATA_TIME_OUT is returned. Packets dropped by the
+   *        speed gate count as received, so a stalled motor does not time out.
    * @retval value is ldlidar::LidarStatus Enum Type, definition in "ldlidar_driver/include/ldlidar_datatype.h", value is:
    *  ldlidar::LidarStatus::NORMAL   // 雷达正常
    *  lldlidar::LidarStatus::ERROR    // 雷达异常错误
@@ -81,6 +84,13 @@ public:
   LidarStatus GetLaserScanData(Points2D& dst, int64_t timeout = 1000);
   
   bool GetLidarScanFreq(double& spin_hz);  
+
+  /**
+   * @brief motor speed gate, see LiPkg::SetSpeedGate. Call before Start().
+  */
+  void SetSpeedGate(double nominal_dps, double tolerance, double settle_s);
+
+  LiPkg::SpeedGateStats GetSpeedGateStats(void);
 
   /**
    * @brief register get timestamp handle functional.
